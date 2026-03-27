@@ -911,11 +911,13 @@ fn build_config(
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
         platform: ironrdp::pdu::rdp::capability_sets::MajorPlatformType::UNSPECIFIED,
         compression_type: None,
-        enable_server_pointer: false,
+        // tdmanh1 27/03/2026, bật cờ này lên để khi render trên trình duyệt mong muốn render cả con trỏ chuột cho tiện thao tác
+        enable_server_pointer: true,
         autologon: false,
         enable_audio_playback: false,
         request_data: None,
-        pointer_software_rendering: false,
+        // tdmanh1 27/03/2026, bật cờ này lên để khi render trên trình duyệt mong muốn render cả con trỏ chuột cho tiện thao tác
+        pointer_software_rendering: true,
         multitransport_flags: None,
         performance_flags: PerformanceFlags::default(),
         desktop_scale_factor: 0,
