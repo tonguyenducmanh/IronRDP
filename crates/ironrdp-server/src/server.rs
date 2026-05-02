@@ -1,4 +1,5 @@
 use core::net::SocketAddr;
+use core::time::Duration;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -22,13 +23,14 @@ use ironrdp_svc::{ChannelFlags, StaticChannelId, StaticChannelSet, SvcProcessor,
 use ironrdp_tokio::{FramedRead, FramedWrite, TokioFramed, split_tokio_framed, unsplit_tokio_framed};
 use rdpsnd::server::{RdpsndServer, RdpsndServerMessage};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
-use tokio::net::TcpListener;
+use tokio::net::TcpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, trace, warn};
 use {ironrdp_dvc as dvc, ironrdp_rdpsnd as rdpsnd};
 
+use crate::autodetect::{AutoDetectManager, RttSnapshot};
 use crate::clipboard::CliprdrServerFactory;
 use crate::display::{DisplayUpdate, RdpServerDisplay};
 use crate::echo::{EchoDvcBridge, EchoServerHandle, EchoServerMessage, build_echo_request};
@@ -37,6 +39,53 @@ use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
 use crate::gfx::{EgfxServerMessage, GfxServerFactory};
 use crate::handler::RdpServerInputHandler;
 use crate::{SoundServerFactory, builder, capabilities};
+
+/// TCP listen backlog size for the RDP server socket.
+const LISTENER_BACKLOG: u32 = 1024;
+
+/// Action to take after a client disconnects.
+///
+/// Returned by [`ConnectionHandler::on_disconnected`] to control whether
+/// the server continues accepting new connections or shuts down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostConnectionAction {
+    /// Continue accepting new connections.
+    Continue,
+    /// Stop the accept loop and return from [`RdpServer::run`].
+    Stop,
+}
+
+/// Hooks for connection lifecycle events in [`RdpServer::run`].
+///
+/// Implement this trait to add pre-accept filtering (rate limiting,
+/// IP allowlists) and post-disconnect logic (cleanup, session validity
+/// checks, metrics).
+///
+/// All methods have default implementations that accept all connections
+/// and continue unconditionally.
+pub trait ConnectionHandler: Send {
+    /// Called after `accept()` returns but before `run_connection()`.
+    ///
+    /// Return `false` to reject the connection (the TCP stream is dropped).
+    fn on_accept(&mut self, peer: SocketAddr) -> bool {
+        let _ = peer;
+        true
+    }
+
+    /// Called after `run_connection()` completes (successfully or with error).
+    ///
+    /// `duration` is the wall-clock time the connection was active.
+    /// `error` is `Some` if the connection ended with an error.
+    fn on_disconnected(
+        &mut self,
+        peer: SocketAddr,
+        duration: Duration,
+        error: Option<&anyhow::Error>,
+    ) -> PostConnectionAction {
+        let _ = (peer, duration, error);
+        PostConnectionAction::Continue
+    }
+}
 
 #[derive(Clone)]
 pub struct RdpServerOptions {
@@ -240,6 +289,8 @@ pub struct RdpServer {
     ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
     creds: Option<Credentials>,
     local_addr: Option<SocketAddr>,
+    autodetect: Option<AutoDetectManager>,
+    connection_handler: Option<Box<dyn ConnectionHandler>>,
 }
 
 #[derive(Debug)]
@@ -252,6 +303,8 @@ pub enum ServerEvent {
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
     #[cfg(feature = "egfx")]
     Egfx(EgfxServerMessage),
+    /// Trigger an RTT measurement probe (requires auto-detect enabled).
+    AutoDetectRttRequest,
 }
 
 pub trait ServerEventSender {
@@ -278,6 +331,7 @@ impl RdpServer {
         display: Box<dyn RdpServerDisplay>,
         mut sound_factory: Option<Box<dyn SoundServerFactory>>,
         mut cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
+        connection_handler: Option<Box<dyn ConnectionHandler>>,
         #[cfg(feature = "egfx")] mut gfx_factory: Option<Box<dyn GfxServerFactory>>,
     ) -> Self {
         let (ev_sender, ev_receiver) = ServerEvent::create_channel();
@@ -307,6 +361,8 @@ impl RdpServer {
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
             creds: None,
             local_addr: None,
+            autodetect: None,
+            connection_handler,
         }
     }
 
@@ -321,6 +377,26 @@ impl RdpServer {
     /// Returns the shared ECHO server handle for runtime probe requests and RTT measurements.
     pub fn echo_handle(&self) -> &EchoServerHandle {
         &self.echo_handle
+    }
+
+    /// Enable protocol-level auto-detect ([MS-RDPBCGR 2.2.14]).
+    ///
+    /// Auto-detect uses lightweight Share Data PDUs on the IO channel,
+    /// separate from the ECHO DVC. It supports bandwidth measurement
+    /// in addition to RTT and works even when DVC is unavailable.
+    ///
+    /// Send probes via [`ServerEvent::AutoDetectRttRequest`] and
+    /// query results with [`rtt_snapshot()`](Self::rtt_snapshot).
+    pub fn enable_autodetect(&mut self) {
+        self.autodetect = Some(AutoDetectManager::new());
+    }
+
+    /// Get the latest auto-detect RTT snapshot.
+    ///
+    /// Returns `None` if auto-detect is not enabled or no measurements
+    /// have been received yet.
+    pub fn rtt_snapshot(&self) -> Option<RttSnapshot> {
+        self.autodetect.as_ref().and_then(|ad| ad.snapshot())
     }
 
     /// Returns the shared EGFX server handle for proactive frame submission.
@@ -448,7 +524,32 @@ impl RdpServer {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let listener = TcpListener::bind(self.opts.addr).await?;
+        // Create socket with control over options before binding.
+        // Using TcpSocket instead of TcpListener::bind() allows setting
+        // SO_REUSEADDR and IPv6 dual-stack mode.
+        let socket = match self.opts.addr {
+            SocketAddr::V4(_) => TcpSocket::new_v4().context("create IPv4 socket")?,
+            SocketAddr::V6(_) => {
+                // IPv6 socket: on Linux, dual-stack is the default
+                // (net.ipv6.bindv6only=0), so IPv4 clients connect as
+                // IPv4-mapped addresses (::ffff:x.x.x.x). On platforms
+                // where IPV6_V6ONLY defaults to 1 (Windows, some BSDs),
+                // only IPv6 clients will be accepted and a separate IPv4
+                // listener would be needed.
+                TcpSocket::new_v6().context("create IPv6 socket")?
+            }
+        };
+
+        // SO_REUSEADDR prevents EADDRINUSE when restarting the server while
+        // the previous socket is still in TIME_WAIT. Only set on Unix;
+        // on Windows SO_REUSEADDR has different semantics that allow a
+        // second process to bind the same port, which is a security risk.
+        #[cfg(unix)]
+        socket.set_reuseaddr(true).context("set SO_REUSEADDR")?;
+
+        socket.bind(self.opts.addr).context("bind listen address")?;
+
+        let listener = socket.listen(LISTENER_BACKLOG).context("start listener")?;
         let local_addr = listener.local_addr()?;
 
         debug!("Listening for connections on {local_addr}");
@@ -478,10 +579,37 @@ impl RdpServer {
                 Ok((stream, peer)) = listener.accept() => {
                     debug!(?peer, "Received connection");
                     drop(ev_receiver);
-                    if let Err(error) = self.run_connection(stream).await {
-                        error!(?error, "Connection error");
+
+                    let accepted = self.connection_handler
+                        .as_mut()
+                        .is_none_or(|h| h.on_accept(peer));
+
+                    if !accepted {
+                        debug!(?peer, "Connection rejected by handler");
+                        drop(stream);
+                    } else {
+                        let started = tokio::time::Instant::now();
+                        let result = self.run_connection(stream).await;
+                        let duration = started.elapsed();
+
+                        if let Err(ref error) = result {
+                            error!(?error, "Connection error");
+                        }
+
+                        self.static_channels = StaticChannelSet::new();
+
+                        if let Some(ref mut handler) = self.connection_handler {
+                            let action = handler.on_disconnected(
+                                peer,
+                                duration,
+                                result.as_ref().err(),
+                            );
+                            if action == PostConnectionAction::Stop {
+                                debug!(?peer, "Handler requested stop after disconnect");
+                                break;
+                            }
+                        }
                     }
-                    self.static_channels = StaticChannelSet::new();
                 }
                 else => break,
             }
@@ -570,6 +698,7 @@ impl RdpServer {
         &mut self,
         events: &mut Vec<ServerEvent>,
         writer: &mut impl FramedWrite,
+        io_channel_id: u16,
         user_channel_id: u16,
     ) -> Result<RunState> {
         // Avoid wave message queuing up and causing extra delays.
@@ -626,10 +755,6 @@ impl RdpServer {
                         ClipboardMessage::SendInitiateCopy(formats) => cliprdr.initiate_copy(&formats),
                         ClipboardMessage::SendFormatData(data) => cliprdr.submit_format_data(data),
                         ClipboardMessage::SendInitiatePaste(format) => cliprdr.initiate_paste(format),
-                        ClipboardMessage::SendLockClipboard { clip_data_id } => cliprdr.lock_clipboard(clip_data_id),
-                        ClipboardMessage::SendUnlockClipboard { clip_data_id } => {
-                            cliprdr.unlock_clipboard(clip_data_id)
-                        }
                         ClipboardMessage::SendFileContentsRequest(request) => cliprdr.request_file_contents(request),
                         ClipboardMessage::SendFileContentsResponse(response) => cliprdr.submit_file_contents(response),
                         ClipboardMessage::Error(error) => {
@@ -685,6 +810,18 @@ impl RdpServer {
                         writer.write_all(&data).await?;
                     }
                 },
+                ServerEvent::AutoDetectRttRequest => {
+                    if let Some(ref mut ad) = self.autodetect {
+                        ad.expire_stale_probes(crate::autodetect::RTT_PROBE_MAX_AGE);
+                        let request = ad.send_rtt_request();
+                        let data = encode_share_data_pdu(
+                            rdp::headers::ShareDataPdu::AutoDetectReq(request),
+                            io_channel_id,
+                            user_channel_id,
+                        )?;
+                        writer.write_all(&data).await?;
+                    }
+                }
             }
         }
 
@@ -776,7 +913,7 @@ impl RdpServer {
                 }
                 let mut this = this.lock().await;
                 match this
-                    .dispatch_server_events(&mut events, &mut event_writer, user_channel_id)
+                    .dispatch_server_events(&mut events, &mut event_writer, io_channel_id, user_channel_id)
                     .await?
                 {
                     RunState::Continue => continue,
@@ -996,6 +1133,16 @@ impl RdpServer {
                     return Ok(true);
                 }
 
+                rdp::headers::ShareDataPdu::AutoDetectRsp(response) => {
+                    if let Some(ref mut ad) = self.autodetect {
+                        if let Some(rtt_ms) = ad.handle_response(&response) {
+                            debug!(rtt_ms, seq = response.sequence_number(), "RTT measured");
+                        } else {
+                            trace!(seq = response.sequence_number(), "Unmatched auto-detect response");
+                        }
+                    }
+                }
+
                 unexpected => {
                     warn!(?unexpected, "Unexpected share data pdu");
                 }
@@ -1120,6 +1267,37 @@ impl RdpServer {
         debug!(?creds, "Changing credentials");
         self.creds = creds
     }
+}
+
+/// Encode a server-initiated Share Data PDU for the IO channel.
+///
+/// `share_id` is hard-coded to 0, matching the existing convention in
+/// `deactivate_all()`. In practice, RDP clients do not validate `share_id`
+/// on server-initiated PDUs, but a future refactor could thread the
+/// negotiated value from the Demand Active exchange if needed.
+fn encode_share_data_pdu(
+    share_data_pdu: rdp::headers::ShareDataPdu,
+    io_channel_id: u16,
+    user_channel_id: u16,
+) -> Result<Vec<u8>> {
+    let header = rdp::headers::ShareDataHeader {
+        share_data_pdu,
+        stream_priority: rdp::headers::StreamPriority::Medium,
+        compression_flags: rdp::headers::CompressionFlags::empty(),
+        compression_type: rdp::client_info::CompressionType::K8,
+    };
+    let pdu = rdp::headers::ShareControlHeader {
+        share_id: 0,
+        pdu_source: user_channel_id,
+        share_control_pdu: ShareControlPdu::Data(header),
+    };
+    let user_data = encode_vec(&pdu)?.into();
+    let mcs_pdu = SendDataIndication {
+        initiator_id: user_channel_id,
+        channel_id: io_channel_id,
+        user_data,
+    };
+    Ok(encode_vec(&X224(mcs_pdu))?)
 }
 
 async fn deactivate_all(
